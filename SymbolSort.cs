@@ -131,7 +131,12 @@ namespace Dia2Lib
         [FieldOffset(36)]
         public DataSectionFlags Characteristics;
 
-        public string Name => Encoding.UTF8.GetString(ShortName).TrimEnd('\0');
+        public string Name {
+            get
+            {
+                return Encoding.UTF8.GetString(ShortName).TrimEnd('\0');
+            }
+        }
     }
 
     // This class is a specialization of IDiaEnumDebugStreamData.
@@ -197,7 +202,7 @@ namespace SymbolSort
     };
 
     [Flags]
-    enum Options
+    enum UserFlags
     {
         None = 0x0,
         DumpCompleteSymbols = 0x1,
@@ -314,6 +319,34 @@ namespace SymbolSort
             }
 
             return ungrouped_name;
+        }
+
+        private static string[] SplitIntoCmdArgs(string text)
+        {
+            //replace spaces inside quotes
+            char placeholder = Char.ConvertFromUtf32(1).Single();
+            int pos = 0;
+            while (pos < text.Length)
+            {
+                int left = text.IndexOf('"', pos);
+                if (left == -1) break;
+                int right = text.IndexOf('"', left + 1);
+                if (right == -1) break;
+                text = text.Substring(0, left) + text.Substring(left, right - left).Replace(' ', placeholder) + text.Substring(right);
+                pos = right + 1;
+            }
+            //split by spaces
+            string[] addedArgs = text.Split(new char[0], StringSplitOptions.RemoveEmptyEntries);
+            //replace back to spaces
+            for (int i = 0; i < addedArgs.Length; i++)
+            {
+                string s = addedArgs[i];
+                s = s.Replace(placeholder, ' ');
+                if (s.StartsWith("\"") && s.EndsWith("\""))
+                    s = s.Substring(1, s.Length - 2);
+                addedArgs[i] = s;
+            }
+            return addedArgs;
         }
 
         private static void ParseBsdSymbol(string line, out Symbol symbol)
@@ -525,11 +558,14 @@ namespace SymbolSort
             }
         }
 
+        private static Regex ReadSymbolsFromCOMDAT_regexName = new Regex(@"\n[ \t]*([^ \t]+)[ \t]+name", RegexOptions.Compiled);
+        private static Regex ReadSymbolsFromCOMDAT_regexSize = new Regex(@"\n[ \t]*([A-Za-z0-9]+)[ \t]+size of raw data", RegexOptions.Compiled);
+        private static Regex ReadSymbolsFromCOMDAT_regexCOMDAT = new Regex(@"\n[ \t]*COMDAT; sym= \""([^\n\""]+)", RegexOptions.Compiled);
         private static void ReadSymbolsFromCOMDAT(List<Symbol> symbols, string inFilename)
         {
-            Regex regexName = new Regex(@"\n[ \t]*([^ \t]+)[ \t]+name");
-            Regex regexSize = new Regex(@"\n[ \t]*([A-Za-z0-9]+)[ \t]+size of raw data");
-            Regex regexCOMDAT = new Regex(@"\n[ \t]*COMDAT; sym= \""([^\n\""]+)");
+            Regex regexName = ReadSymbolsFromCOMDAT_regexName;
+            Regex regexSize = ReadSymbolsFromCOMDAT_regexSize;
+            Regex regexCOMDAT = ReadSymbolsFromCOMDAT_regexCOMDAT;
 
             StreamReader reader = new StreamReader(inFilename);
 
@@ -1140,9 +1176,10 @@ namespace SymbolSort
         }
 
 
-        private static void ReadSymbolsFromPDB(List<Symbol> symbols, string filename, string searchPath, Options options)
+        private static void ReadSymbolsFromPDB(List<Symbol> symbolsOutput, string filename, string searchPath, UserFlags options)
         {
             DiaSource diaSource = new DiaSource();
+            List<Symbol> symbols = new List<Symbol>();
 
             if (Path.GetExtension(filename).ToLower() == ".pdb")
             {
@@ -1171,7 +1208,7 @@ namespace SymbolSort
             // Symbols are loaded in priority order.  Symbols loaded earlier will be preferred to
             // symbols loaded later when removing overlapping and redundant symbols.
 
-            bool includePublicSymbols = (options & Options.IncludePublicSymbols) == Options.IncludePublicSymbols;
+            bool includePublicSymbols = (options & UserFlags.IncludePublicSymbols) == UserFlags.IncludePublicSymbols;
             if (includePublicSymbols)
             {
                 // Generic public symbols are preferred to global function and data symbols because they will included alignment in
@@ -1201,7 +1238,7 @@ namespace SymbolSort
             ReadSymbolsFromScope(globalScope, SymTagEnum.SymTagData, SymbolFlags.Weak, 0, 100, diaSession, sectionContribs, compilandFileMap, symbols);
             Console.WriteLine();
 
-            bool includeSectionsAsSymbols = (options & Options.IncludeSectionsAsSymbols) == Options.IncludeSectionsAsSymbols;
+            bool includeSectionsAsSymbols = (options & UserFlags.IncludeSectionsAsSymbols) == UserFlags.IncludeSectionsAsSymbols;
             if (includeSectionsAsSymbols)
             {
                 Console.Write("Reading sections as symbols... ");
@@ -1209,7 +1246,7 @@ namespace SymbolSort
                 Console.WriteLine("{0,3}", 100);
             }
 
-            bool keepRedundantSymbols = (options & Options.KeepRedundantSymbols) == Options.KeepRedundantSymbols;
+            bool keepRedundantSymbols = (options & UserFlags.KeepRedundantSymbols) == UserFlags.KeepRedundantSymbols;
             if (keepRedundantSymbols)
             {
                 AddSymbolsForMissingAddresses(symbols);
@@ -1221,6 +1258,9 @@ namespace SymbolSort
                 Console.WriteLine("{0,3}", 100);
                 symbols.RemoveAll(delegate(Symbol s) { return s.size == 0 && ((s.flags & SymbolFlags.Weak) == SymbolFlags.Weak); });
             }
+
+            //add read symbols to the output list
+            symbolsOutput.AddRange(symbols);
         }
 
         private static void WriteSymbolList(TextWriter writer, List<Symbol> symbolList, int maxCount)
@@ -1501,7 +1541,7 @@ namespace SymbolSort
             writer.WriteLine();
         }
 
-        private static void LoadSymbols(InputFile inputFile, List<Symbol> symbols, string searchPath, Options options)
+        private static void LoadSymbols(InputFile inputFile, List<Symbol> symbols, string searchPath, UserFlags options)
         {
             Console.WriteLine("Loading symbols from {0}", inputFile.filename);
             switch (inputFile.type)
@@ -1519,28 +1559,25 @@ namespace SymbolSort
             }
         }
 
-        private static bool ParseArgs(
-            string[] args, 
-            out List<InputFile> inputFiles, 
-            out string outFilename, 
-            out List<InputFile> differenceFiles,
-            out string searchPath,
-            out int maxCount, 
-            out List<string> exclusions,
-            out List<RegexReplace> pathReplacements,
-            out Options options)
+        class UserOptions
         {
-            maxCount = 500;
-            exclusions = new List<string>();
-            inputFiles = new List<InputFile>();
-            outFilename = null;
-            differenceFiles = new List<InputFile>();
-            searchPath = null;
-            pathReplacements = new List<RegexReplace>();
-            options = 0;
+            public List<InputFile> inputFiles = new List<InputFile>();
+            public string outFilename = null;
+            public List<InputFile> differenceFiles = new List<InputFile>();
+            public string searchPath = null;
+            public int maxCount = 500;
+            public List<string> exclusions = new List<string>();
+            public List<string> includedSections = null;
+            public List<RegexReplace> pathReplacements = new List<RegexReplace>();
+            public UserFlags flags = 0;
+        }
+
+        private static UserOptions ParseArgs(string[] args)
+        {
+            UserOptions opts = new UserOptions();
 
             if (args.Length < 1)
-                return false;
+                return null;
 
             uint curArg = 0;
             string curArgStr = "";
@@ -1553,56 +1590,61 @@ namespace SymbolSort
                     {
                         try
                         {
-                            maxCount = int.Parse(args[++curArg]);
+                            opts.maxCount = int.Parse(args[++curArg]);
                         }
                         catch (System.FormatException)
                         {
-                            return false;
+                            return null;
                         }
                     }
                     else if (curArgStr == "-exclude")
                     {
-                        exclusions.Add(args[++curArg]);
+                        opts.exclusions.Add(args[++curArg]);
+                    }
+                    else if (curArgStr == "-sections")
+                    {
+                        string value = args[++curArg];
+                        opts.includedSections = value.Split(",".ToCharArray()).ToList();
                     }
                     else if (curArgStr == "-in")
                     {
-                        inputFiles.Add(new InputFile(args[++curArg], InputType.pdb));
+                        opts.inputFiles.Add(new InputFile(args[++curArg], InputType.pdb));
                     }
                     else if (curArgStr == "-in:comdat")
                     {
-                        inputFiles.Add(new InputFile(args[++curArg], InputType.comdat));
+                        opts.inputFiles.Add(new InputFile(args[++curArg], InputType.comdat));
                     }
                     else if (curArgStr == "-in:sysv")
                     {
-                        inputFiles.Add(new InputFile(args[++curArg], InputType.nm_sysv));
+                        opts.inputFiles.Add(new InputFile(args[++curArg], InputType.nm_sysv));
                     }
                     else if (curArgStr == "-in:bsd")
                     {
-                        inputFiles.Add(new InputFile(args[++curArg], InputType.nm_bsd));
+                        opts.inputFiles.Add(new InputFile(args[++curArg], InputType.nm_bsd));
                     }
                     else if (curArgStr == "-out")
                     {
-                        outFilename = args[++curArg];
+                        opts.outFilename = args[++curArg];
                     }
                     else if (curArgStr == "-diff")
                     {
-                        differenceFiles.Add(new InputFile(args[++curArg], InputType.pdb));
+                        opts.differenceFiles.Add(new InputFile(args[++curArg], InputType.pdb));
                     }
                     else if (curArgStr == "-diff:comdat")
                     {
-                        differenceFiles.Add(new InputFile(args[++curArg], InputType.comdat));
+                        opts.differenceFiles.Add(new InputFile(args[++curArg], InputType.comdat));
                     }
                     else if (curArgStr == "-diff:sysv")
                     {
-                        differenceFiles.Add(new InputFile(args[++curArg], InputType.nm_sysv));
+                        opts.differenceFiles.Add(new InputFile(args[++curArg], InputType.nm_sysv));
                     }
                     else if (curArgStr == "-diff:bsd")
                     {
-                        differenceFiles.Add(new InputFile(args[++curArg], InputType.nm_bsd));
+                        opts.differenceFiles.Add(new InputFile(args[++curArg], InputType.nm_bsd));
                     }
                     else if (curArgStr == "-searchpath")
                     {
-                        searchPath = args[++curArg];
+                        opts.searchPath = args[++curArg];
                     }
                     else if (curArgStr == "-path_replace")
                     {
@@ -1614,64 +1656,63 @@ namespace SymbolSort
                         catch (ArgumentException ex)
                         {
                             Console.WriteLine("Invalid -path_replace regex_math option: " + ex.Message);
-                            return false;
+                            return null;
                         }
                         rr.replacement = args[++curArg];
-                        pathReplacements.Add(rr);
+                        opts.pathReplacements.Add(rr);
                     }
                     else if (curArgStr == "-complete")
                     {
-                        options |= Options.DumpCompleteSymbols;
+                        opts.flags |= UserFlags.DumpCompleteSymbols;
                     }
                     else if (curArgStr == "-include_public_symbols")
                     {
-                        options |= Options.IncludePublicSymbols;
+                        opts.flags |= UserFlags.IncludePublicSymbols;
                     }
                     else if (curArgStr == "-keep_redundant_symbols")
                     {
-                        options |= Options.KeepRedundantSymbols;
+                        opts.flags |= UserFlags.KeepRedundantSymbols;
                     }
                     else if (curArgStr == "-include_sections_as_symbols")
                     {
-                        options |= Options.IncludeSectionsAsSymbols;
+                        opts.flags |= UserFlags.IncludeSectionsAsSymbols;
                     }
                     else if (curArgStr == "-include_unmapped_addresses")
                     {
-                        options |= Options.IncludeUnmappedAddresses;
+                        opts.flags |= UserFlags.IncludeUnmappedAddresses;
+                    }
+                    else if (curArgStr == "-options_from_file")
+                    {
+                        StreamReader reader = new StreamReader(args[++curArg]);
+                        string contents = reader.ReadToEnd();
+                        args = args.Concat(SplitIntoCmdArgs(contents)).ToArray();
                     }
                     else
                     {
                         Console.WriteLine("Unrecognized option {0}", args[curArg]);
-                        return false;
+                        return null;
                     }
                 }
             }
             catch (System.IndexOutOfRangeException)
             {
                 Console.WriteLine("Insufficient parameters provided for option {0}", curArgStr);
-                return false;
+                return null;
             }
 
-            if (!inputFiles.Any())
+            if (!opts.inputFiles.Any())
             {
                 Console.WriteLine("At least one input file must be specified");
-                return false;
+                return null;
             }
 
-            return true;
+            return opts;
         }
 
         static void Main(string[] args)
         {
-            int maxCount;
-            List<string> exclusions;
-            List<InputFile> inputFiles;
-            List<InputFile> differenceFiles;
-            List<RegexReplace> pathReplacements;
-            string outFilename;
-            string searchPath;
-            Options options;
-            if (!ParseArgs(args, out inputFiles, out outFilename, out differenceFiles, out searchPath, out maxCount, out exclusions, out pathReplacements, out options))
+            UserOptions opts = ParseArgs(args);
+            if (opts == null)
             {
                 Console.WriteLine();
                 Console.WriteLine("Usage: SymbolSort [options]");
@@ -1693,6 +1734,10 @@ namespace SymbolSort
                 Console.WriteLine("  -exclude substring");
                 Console.WriteLine("      Exclude symbols that contain the specified substring");
                 Console.WriteLine();
+                Console.WriteLine("  -sections sections_list");
+                Console.WriteLine("      Take into account only symbols from specified sections.");
+                Console.WriteLine("      sections_list is comma-separated list of section names (without leading dot).");
+                Console.WriteLine();
                 Console.WriteLine("  -diff:[type] filename");
                 Console.WriteLine("      Use this file as a basis for generating a differences report.");
                 Console.WriteLine("      See -in option for valid types.");
@@ -1709,6 +1754,10 @@ namespace SymbolSort
                 Console.WriteLine();
                 Console.WriteLine("  -complete");
                 Console.WriteLine("      Include a complete listing of all symbols sorted by address.");
+                Console.WriteLine();
+                Console.WriteLine("  -options_from_file filename");
+                Console.WriteLine("      Add content of specified file to command line parameters.");
+                Console.WriteLine("      Used to workaround various Windows limits on command line length.");
                 Console.WriteLine();
                 Console.WriteLine("Options specific to Exe and PDB inputs:");
                 Console.WriteLine("  -include_public_symbols");
@@ -1739,7 +1788,7 @@ namespace SymbolSort
                 return;
             }
 
-            foreach (InputFile inputFile in inputFiles)
+            foreach (InputFile inputFile in opts.inputFiles)
             {
                 if (!File.Exists(inputFile.filename))
                 {
@@ -1748,7 +1797,7 @@ namespace SymbolSort
                 }
             }
 
-            foreach (InputFile inputFile in differenceFiles)
+            foreach (InputFile inputFile in opts.differenceFiles)
             {
                 if (!File.Exists(inputFile.filename))
                 {
@@ -1760,7 +1809,7 @@ namespace SymbolSort
             TextWriter writer;
             try
             {
-                writer = outFilename != null ? new StreamWriter(outFilename) : Console.Out;
+                writer = opts.outFilename != null ? new StreamWriter(opts.outFilename) : Console.Out;
             }
             catch (IOException ex)
             {
@@ -1771,16 +1820,16 @@ namespace SymbolSort
             DateTime startTime = DateTime.Now;
 
             List<Symbol> symbols = new List<Symbol>();
-            foreach (InputFile inputFile in inputFiles)
+            foreach (InputFile inputFile in opts.inputFiles)
             {
-                LoadSymbols(inputFile, symbols, searchPath, options);
+                LoadSymbols(inputFile, symbols, opts.searchPath, opts.flags);
                 Console.WriteLine();
             }
 
-            foreach (InputFile inputFile in differenceFiles)
+            foreach (InputFile inputFile in opts.differenceFiles)
             {
                 List<Symbol> negativeSymbols = new List<Symbol>();
-                LoadSymbols(inputFile, negativeSymbols, searchPath, options);
+                LoadSymbols(inputFile, negativeSymbols, opts.searchPath, opts.flags);
                 Console.WriteLine();
                 foreach (Symbol s in negativeSymbols)
                 {
@@ -1790,18 +1839,29 @@ namespace SymbolSort
                 }
             }
 
-            if (exclusions.Any())
+            if (opts.exclusions.Any())
             {
                 Console.WriteLine("Removing Exclusions...");
                 symbols.RemoveAll(
                     delegate(Symbol s)
                     {
-                        foreach (string e in exclusions)
+                        foreach (string e in opts.exclusions)
                         {
                             if (s.name.Contains(e))
                                 return true;
                         }
                         return false;
+                    });
+            }
+
+            if (opts.includedSections != null)
+            {
+                Console.WriteLine("Filtering Sections...");
+                symbols.RemoveAll(
+                    delegate(Symbol s)
+                    {
+                        string name = s.section.TrimStart(".".ToCharArray());
+                        return !opts.includedSections.Contains(s.section);
                     });
             }
 
@@ -1819,12 +1879,12 @@ namespace SymbolSort
                 }
 
                 if (unknownSize > 0 &&
-                    (options & Options.IncludeUnmappedAddresses) != Options.IncludeUnmappedAddresses)
+                    (opts.flags & UserFlags.IncludeUnmappedAddresses) != UserFlags.IncludeUnmappedAddresses)
                 {
                     symbols.RemoveAll(delegate(Symbol s) { return (s.flags & SymbolFlags.Unmapped) == SymbolFlags.Unmapped; });
                 }
 
-                if (differenceFiles.Any())
+                if (opts.differenceFiles.Any())
                 {
                     writer.WriteLine("Raw Symbols Differences");
                     writer.WriteLine("Total Count  : {0}", totalCount);
@@ -1854,12 +1914,12 @@ namespace SymbolSort
                             return s0.name.CompareTo(s1.name);
                         });
                     writer.WriteLine("Sorted by Size");
-                    WriteSymbolList(writer, symbols, maxCount);
+                    WriteSymbolList(writer, symbols, opts.maxCount);
                 }
             }
 
             Console.WriteLine("Building folder stats...");
-            DumpFolderStats(writer, symbols, maxCount, differenceFiles.Any(), pathReplacements);
+            DumpFolderStats(writer, symbols, opts.maxCount, opts.differenceFiles.Any(), opts.pathReplacements);
 
             Console.WriteLine("Computing section stats...");
             writer.WriteLine("Merged Sections / Types");
@@ -1870,8 +1930,8 @@ namespace SymbolSort
                 {
                     return new string[] { s.section };
                 },
-                maxCount,
-                differenceFiles.Any());
+                opts.maxCount,
+                opts.differenceFiles.Any());
 
             Console.WriteLine("Merging duplicate symbols...");
             writer.WriteLine("Merged Duplicate Symbols");
@@ -1882,8 +1942,8 @@ namespace SymbolSort
                 {
                     return new string[] { s.name };
                 },
-                maxCount,
-                differenceFiles.Any());
+                opts.maxCount,
+                opts.differenceFiles.Any());
 
             Console.WriteLine("Merging template symbols...");
             writer.WriteLine("Merged Template Symbols");
@@ -1897,8 +1957,8 @@ namespace SymbolSort
                     n = ExtractGroupedSubstrings(n, '\'', '\'', "...");
                     return new string[] { n };
                 },
-                maxCount,
-                differenceFiles.Any());
+                opts.maxCount,
+                opts.differenceFiles.Any());
 
             Console.WriteLine("Merging overloaded symbols...");
             writer.WriteLine("Merged Overloaded Symbols");
@@ -1913,8 +1973,8 @@ namespace SymbolSort
                     n = ExtractGroupedSubstrings(n, '(', ')', "...");
                     return new string[] { n };
                 },
-                maxCount,
-                differenceFiles.Any());
+                opts.maxCount,
+                opts.differenceFiles.Any());
 
             Console.WriteLine("Building tag cloud...");
             writer.WriteLine("Symbol Tags");
@@ -1925,10 +1985,10 @@ namespace SymbolSort
                 {
                     return s.name.Split(" ,.&*()<>:'`".ToArray(), StringSplitOptions.RemoveEmptyEntries);
                 },
-                maxCount,
-                differenceFiles.Any());
+                opts.maxCount,
+                opts.differenceFiles.Any());
 
-            if ((options & Options.DumpCompleteSymbols) == Options.DumpCompleteSymbols)
+            if ((opts.flags & UserFlags.DumpCompleteSymbols) == UserFlags.DumpCompleteSymbols)
             {
                 Console.WriteLine("Dumping all symbols...");
                 symbols.Sort(
